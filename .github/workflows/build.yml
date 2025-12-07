@@ -173,7 +173,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh
+          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh cosign grep sed coreutils
           mkdir -p /etc/containers
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' | jq . | tee /etc/containers/policy.json
 
@@ -267,8 +267,6 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
           LABELS: ${{ steps.metadata.outputs.labels }}
           OUTPUT_CSV: ${{ steps.load-outputs.outputs.OUTPUT_CSV }}
           TAGS: ${{ steps.metadata.outputs.tags }}
