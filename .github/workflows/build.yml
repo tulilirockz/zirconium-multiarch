@@ -173,7 +173,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh cosign grep sed coreutils docker findutils
+          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh cosign grep sed coreutils docker findutils bash
           mkdir -p /etc/containers
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' | jq . | tee /etc/containers/policy.json
 
@@ -263,6 +263,7 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
 
       - name: Publish manifest with unified architecture and sign
+        shell: bash
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           COSIGN_EXPERIMENTAL: false
@@ -274,15 +275,17 @@ jobs:
           set -x
 
           OUTPUT_CSV_FILE="$(mktemp)"
-          echo "${OUTPUT_CSV_FILEPUT_CSV}" | base32 -d | tee "${OUTPUT_CSV_FILE}"
+          echo "${OUTPUT_CSV}" | base32 -d | tee "${OUTPUT_CSV_FILE}"
 
           # This is insanely dumb, please PR if you have a better solution ~ @tulilirockz :3c
-          for TARGET_IMAGE in $(xargs -n1 sh -c 'echo "$0" | cut -d, -f2' < "${OUTPUT_CSV_FILE}" | sort | uniq) ; do
+          IMAGES=$(cat "${OUTPUT_CSV_FILE}" | while IFS=$'\n' read -r entry ; do echo $entry | cut -d, -f2 ; done | sort | uniq | tr "\n" " " | sed 's/.$//')
+          for TARGET_IMAGE in ${IMAGES} ; do
             TARGET_MANIFEST="${IMAGE_REGISTRY}/${TARGET_IMAGE}"
             podman manifest create "${TARGET_MANIFEST}"
 
-            for TARGET_PLATFORM in $(grep -F -e "${IMAGE}" "${OUTPUT_CSV_FILE}" | xargs -n1 sh -c 'echo "$0" | cut -d, -f1' | sort | uniq) ; do
-              TARGET_DIGEST="$(grep -F -e "${TARGET_IMAGE}" -e "$PLATFORM" -e "${IMAGE}" "${OUTPUT_CSV_FILE}" | cut -d, -f3)"
+            PLATFORMS=$(grep -F -e "${IMAGE}" "${OUTPUT_CSV_FILE}" | while IFS=$'\n' read -r entry ; do echo $entry | cut -d, -f1 ; done | sort | uniq | tr "\n" " " | sed 's/.$//')
+            for TARGET_PLATFORM in ${PLATFORMS} ; do
+              TARGET_DIGEST="$(grep -F -e ",${TARGET_IMAGE}," "${OUTPUT_CSV_FILE}" | grep -F -e "$TARGET_PLATFORM" | cut -d, -f3 | tr -d "\n")"
               podman manifest add "${TARGET_MANIFEST}" "${TARGET_MANIFEST}@${TARGET_DIGEST}" --arch "${TARGET_PLATFORM}"
             done
 
@@ -290,9 +293,9 @@ jobs:
               podman manifest annotate --index --annotation "$label" "${TARGET_MANIFEST}"
             done <<< "${LABELS}"
 
-            while IFS= read -r TARGET_TAG; do
+            for TARGET_TAG in ${TAGS} ; do
               podman manifest push --all=false --digestfile=/tmp/digestfile "${TARGET_MANIFEST}" "${TARGET_MANIFEST}:${TARGET_TAG}"
-            done <<< "${TAGS}"
+            done
 
-            cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE}@$(< /tmp/digestfile)"
+            cosign sign -y --key env://COSIGN_PRIVATE_KEY "${TARGET_MANIFEST}@$(< /tmp/digestfile)"
           done
