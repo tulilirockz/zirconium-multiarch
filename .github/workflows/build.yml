@@ -173,7 +173,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh cosign grep sed coreutils
+          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh cosign grep sed coreutils docker
           mkdir -p /etc/containers
           echo '{"default":[{"type":"insecureAcceptAnything"}]}' | jq . | tee /etc/containers/policy.json
 
@@ -260,8 +260,7 @@ jobs:
           REGISTRY: ghcr.io
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
-          mkdir -p ~/.docker
-          cat ${XDG_RUNTIME_DIR}/containers/auth.json > ~/.docker/config.json
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
 
       - name: Publish manifest with unified architecture and sign
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
