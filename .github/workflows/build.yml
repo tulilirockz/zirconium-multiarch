@@ -243,85 +243,17 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         id: load-outputs
         run: |
-          DIGESTS_JSON="$(jq -n '{}')"
+          set -x
+          OUTCSV="$(mktemp)"
           for digest_file in /tmp/artifacts/*.txt; do
             # Extract the platform from the file name
-            PLATFORM="$(basename "${digest_file}" | rev | cut -d'-' -f1 | rev | cut -d'.' -f1)"
+            PLATFORM="$(basename "${digest_file}" ".txt" | sed 's/.*-//g')" # amd64, arm64
+            IMAGE_NAME="$(basename "${digest_file}" ".txt" | grep -Po ".*-" | sed 's/-$//')"
             DIGEST="$(cat "${digest_file}")"
-            # Add the platform and digest to the JSON object
-            DIGESTS_JSON="$(echo "${DIGESTS_JSON}" | jq --arg key "${PLATFORM}" --arg value "${DIGEST}" '. + {($key): $value}')"
+            echo "${PLATFORM},${IMAGE_NAME},${DIGEST}" | tee -a "${OUTCSV}"
           done
-          echo "DIGESTS_JSON=$(echo "$DIGESTS_JSON" | jq -c '.')" >> "${GITHUB_OUTPUT}"
+          echo "OUTPUT_CSV=$(< "${OUTCSV}")" >> "${GITHUB_OUTPUT}"
 
-      - name: Create Manifest
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        id: create-manifest
-        env:
-          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-        run: |
-          podman manifest create ${IMAGE_REGISTRY}/${IMAGE_NAME}
-          echo "MANIFEST=${IMAGE_REGISTRY}/${IMAGE_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Populate Manifest
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        env:
-          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
-          DIGESTS_JSON: ${{ steps.load-outputs.outputs.DIGESTS_JSON }}
-          LABELS: ${{ steps.metadata.outputs.labels }}
-          PLATFORMS: "amd64 arm64"
-        run: |
-          DIGESTS=$(echo "$DIGESTS_JSON" | jq -c '.')
-          # turn the comma separated string into a list
-          platforms=()
-          IFS=',' read -r -a platforms <<< "${PLATFORMS}"
-          for platform in ${platforms[@]}; do
-            digest="$(echo $DIGESTS | jq -r ".$platform")"
-            echo "Adding ${IMAGE_REGISTRY}/${IMAGE_NAME}@${digest} for ${platform}"
-            podman manifest add "${MANIFEST}" "${IMAGE_REGISTRY}/${IMAGE_NAME}@${digest}" --arch "${platform}"
-          done
-
-          # Apply the labels to the manifest (separated by newlines)
-          while IFS= read -r label; do
-            echo "Applying label ${label} to manifest"
-            podman manifest annotate --index --annotation "$label" "${MANIFEST}"
-          done <<< "${LABELS}"
-
-      - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        env:
-          REGISTRY: ghcr.io
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
-
-      - name: Push Manifest
-        if: github.event_name != 'pull_request'
-        id: push_manifest
-        env:
-          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
-          TAGS: ${{ steps.metadata.outputs.tags }}
-          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-        run: |
-          while IFS= read -r tag; do
-            podman manifest push --all=false --digestfile=/tmp/digestfile $MANIFEST $IMAGE_REGISTRY/$IMAGE_NAME:$tag
-          done <<< "$TAGS"
-
-          DIGEST=$(cat /tmp/digestfile)
-          echo "DIGEST=$DIGEST" >> $GITHUB_OUTPUT
-          echo "IMAGE=$IMAGE_REGISTRY/$IMAGE_NAME" >> $GITHUB_OUTPUT
-
-  # Cosign throws errors when ran inside the Fedora container for one reason or another
-  # so we move this to another step in order to run on Ubuntu
-  sign:
-    needs: manifest
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-    steps:
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
@@ -330,14 +262,39 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
           cat ${XDG_RUNTIME_DIR}/containers/auth.json > ~/.docker/config.json
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-
-      - name: Sign Manifest
+      - name: Publish manifest with unified architecture and sign
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
-          DIGEST: ${{ needs.manifest.outputs.digest }}
-          IMAGE: ${{ needs.manifest.outputs.image }}
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          LABELS: ${{ steps.metadata.outputs.labels }}
+          OUTPUT_CSV: ${{ steps.load-outputs.outputs.OUTPUT_CSV }}
+          TAGS: ${{ steps.metadata.outputs.tags }}
         run: |
-          cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${DIGEST}"
+          set -x
+
+          OUT="$(mktemp)"
+          sed 's/ /\n/g' < "${OUTPUT_CSV}" | tee "${OUT}"
+
+          # This is insanely dumb, please PR if you have a better solution ~ @tulilirockz :3c
+          for TARGET_IMAGE in $(xargs -n1 sh -c 'echo "$0" | cut -d, -f2' < "${OUT}" | sort | uniq) ; do
+            TARGET_MANIFEST="${IMAGE_REGISTRY}/${TARGET_IMAGE}"
+            podman manifest create "${TARGET_MANIFEST}"
+
+            for TARGET_PLATFORM in $(grep -F -e "${IMAGE}" "${OUT}" | xargs -n1 sh -c 'echo "$0" | cut -d, -f1' | sort | uniq) ; do
+              TARGET_DIGEST="$(grep -F -e "${TARGET_IMAGE}" -e "$PLATFORM" -e "${IMAGE}" "${OUT}" | cut -d, -f3)"
+              podman manifest add "${TARGET_MANIFEST}" "${TARGET_MANIFEST}@${TARGET_DIGEST}" --arch "${TARGET_PLATFORM}"
+            done
+
+            while IFS= read -r label; do
+              podman manifest annotate --index --annotation "$label" "${TARGET_MANIFEST}"
+            done <<< "${LABELS}"
+
+            while IFS= read -r TARGET_TAG; do
+              podman manifest push --all=false --digestfile=/tmp/digestfile "${TARGET_MANIFEST}" "${TARGET_MANIFEST}:${TARGET_TAG}"
+            done <<< "${TAGS}"
+
+            cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE}@$(< /tmp/digestfile)"
+          done
