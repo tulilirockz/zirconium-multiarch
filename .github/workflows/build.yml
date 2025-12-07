@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Maximize build space
-        if: ${{ matrix.platform != 'arm64' && inputs.cleanup_runner }}
+        if: ${{ matrix.platform != 'arm64' }}
         uses: ublue-os/container-storage-action@main
         with:
           target-dir: /var/lib/containers
@@ -155,7 +155,7 @@ jobs:
             /tmp/outputs/digests/*.txt
 
   manifest:
-    name: Create ${{ inputs.image-name }}:${{ inputs.centos-version }} Manifest
+    name: Create Manifest
     runs-on: ubuntu-latest
     if: always()
     needs:
@@ -172,7 +172,10 @@ jobs:
       digest: ${{ steps.push_manifest.outputs.DIGEST }}
     steps:
       - name: Install dependencies
-        run: apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ containers-common bash-binsh
+        run: |
+          apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ bash-binsh
+          mkdir -p /etc/containers
+          echo '{"default":[{"type":"insecureAcceptAnything"}]}' | jq . | tee /etc/containers/policy.json
 
       # FIXME: REMOVE THIS PLEASE <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategyfail-fast>
       - name: Exit on failure
@@ -266,7 +269,7 @@ jobs:
           MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
           DIGESTS_JSON: ${{ steps.load-outputs.outputs.DIGESTS_JSON }}
           LABELS: ${{ steps.metadata.outputs.labels }}
-          PLATFORMS: "${{ inputs.platforms }}"
+          PLATFORMS: "amd64 arm64"
         run: |
           DIGESTS=$(echo "$DIGESTS_JSON" | jq -c '.')
           # turn the comma separated string into a list
