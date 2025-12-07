@@ -260,6 +260,7 @@ jobs:
           REGISTRY: ghcr.io
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+          mkdir -p ~/.docker
           cat ${XDG_RUNTIME_DIR}/containers/auth.json > ~/.docker/config.json
 
       - name: Publish manifest with unified architecture and sign
