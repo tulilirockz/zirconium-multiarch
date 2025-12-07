@@ -21,36 +21,175 @@ env:
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
   DEFAULT_TAG: "latest"
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
-  cancel-in-progress: true
-
 jobs:
   build_push:
     name: Build and push image
-    runs-on: ubuntu-24.04
-
     permissions:
       contents: read
       packages: write
       id-token: write
-
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         flavor: ["", "nvidia"]
+        platform: ["amd64", "arm64"]
+    runs-on: ${{ matrix.platform == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
 
     steps:
-      - name: Mount BTRFS for podman storage
-        id: container-storage-action
-        uses: ublue-os/container-storage-action@911baca08baf30c8654933e9e9723cb399892140
-        continue-on-error: true
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Maximize build space
+        if: ${{ matrix.platform != 'arm64' && inputs.cleanup_runner }}
+        uses: ublue-os/container-storage-action@main
         with:
           target-dir: /var/lib/containers
-          mount-opts: compress-force=zstd:2
 
-      - name: Checkout
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v5
+      - name: Change image name depending on build flavor
+        env:
+          BUILD_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          if [ "${BUILD_FLAVOR}" != "" ] ; then
+            echo "IMAGE_NAME=${IMAGE_NAME}-${{ matrix.flavor }}" >> $GITHUB_ENV
+          fi
+
+      - name: Build image
+        id: build
+        env:
+          BUILD_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          set -x
+          sudo podman build "--build-arg=BUILD_FLAVOR=${BUILD_FLAVOR}" -t "${IMAGE_NAME}:${DEFAULT_TAG}" -f ./Containerfile .
+          echo "image_tag=${DEFAULT_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run Rechunker
+        id: rechunk
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: hhd-dev/rechunk@5fbe1d3a639615d2548d83bc888360de6267b1a2 # v1.2.4
+        with:
+          rechunk: "ghcr.io/hhd-dev/rechunk:v1.2.4"
+          ref: "localhost/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}"
+          prev-ref: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}"
+          skip_compression: true
+          labels: ${{ steps.metadata.outputs.labels }} # Rechunk strips out all the labels during build, this needs to be reapplied here with newline separator
+
+      - name: Load Image
+        id: load
+        env:
+          RECHUNK_RAN: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          RECHUNK_REF: ${{ steps.rechunk.outputs.ref }}
+          RECHUNK_LOCATION: ${{ steps.rechunk.outputs.location }}
+        run: |
+          if [ "${RECHUNK_RAN}" == "true" ] ; then
+            IMAGE="$(podman pull "${RECHUNK_REF}")"
+            sudo rm -rf "${RECHUNK_LOCATION}"
+          else
+            IMAGE="localhost/${IMAGE_NAME}:${DEFAULT_TAG}"
+          fi
+          podman image tag "${IMAGE}" "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}"
+
+          IMAGE="${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}"
+          IMAGE_DIGEST="$(podman image inspect --format '{{.Digest}}' "${IMAGE}")"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          REGISTRY: ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        id: push
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_DIGEST: ${{ steps.load.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          MAX_RETRIES: 3
+        run: |
+          set -x
+          podman tag "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}" "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}-${PLATFORM}"
+          for i in $(seq "${MAX_RETRIES}"); do
+            podman push --digestfile=/tmp/digestfile "${IMAGE_REGISTRY}/${IMAGE_NAME}:${DEFAULT_TAG}-${PLATFORM}" && break || sleep $((5 * i));
+          done
+          echo "remote_image_digest=$(cat /tmp/digestfile)" >> $GITHUB_OUTPUT
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+
+      - name: Sign Image
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          REMOTE_IMAGE_DIGEST: ${{ steps.push.outputs.remote_image_digest }}
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+        run: cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE_REGISTRY}/${IMAGE_NAME}@${REMOTE_IMAGE_DIGEST}"
+
+      - name: Create Job Outputs
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          PLATFORM: ${{ matrix.platform }}
+          DIGEST: ${{ steps.push.outputs.remote_image_digest }}
+        run: |
+          set -x
+          mkdir -p /tmp/outputs/digests
+          echo "${DIGEST}" | tee "/tmp/outputs/digests/${IMAGE_NAME}-${PLATFORM}.txt"
+
+      - name: Upload Output Artifacts
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ${{ env.IMAGE_NAME }}-${{ matrix.platform }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            /tmp/outputs/digests/*.txt
+
+  manifest:
+    name: Create ${{ inputs.image-name }}:${{ inputs.centos-version }} Manifest
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - generate_matrix
+      - build_push
+    container:
+      image: cgr.dev/chainguard/wolfi-base:latest
+      options: --privileged --security-opt seccomp=unconfined
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      image: ${{ steps.push_manifest.outputs.IMAGE }}
+      digest: ${{ steps.push_manifest.outputs.DIGEST }}
+    steps:
+      - name: Install dependencies
+        run: apk add jq git podman uutils bash conmon crun netavark fuse-overlayfs libstdc++ containers-common bash-binsh
+
+      # FIXME: REMOVE THIS PLEASE <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategyfail-fast>
+      - name: Exit on failure
+        env:
+          JOBS: ${{ toJson(needs) }}
+        run: |
+          echo "Job status:"
+          $JOBS | jq -r 'to_entries[] | " - \(.key): \(.value.result)"'
+
+          for i in $(echo "${JOBS}" | jq -r 'to_entries[] | .value.result'); do
+            if [ "$i" != "success" ] && [ "$i" != "skipped" ]; then
+              echo ""
+              echo "Status check not okay!"
+              exit 1
+            fi
+          done
 
       - name: Get current date
         id: date
@@ -65,6 +204,8 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: metadata
         with:
+          sep-tags: " "
+          sep-annotations: " "
           tags: |
             type=raw,value=${{ env.DEFAULT_TAG }}
             type=raw,value=${{ env.DEFAULT_TAG }}.{{date 'YYYYMMDD'}}
@@ -87,74 +228,114 @@ jobs:
             io.artifacthub.package.logo-url=${{ env.IMAGE_LOGO_URL }}
             io.artifacthub.package.prerelease=false
             containers.bootc=1
-          sep-tags: " "
-          sep-annotations: " "
 
-      - name: Change image name depending on build flavor
-        env:
-          BUILD_FLAVOR: ${{ matrix.flavor }}
-        run: |
-          if [ "${BUILD_FLAVOR}" != "" ] ; then
-            echo "IMAGE_NAME=${IMAGE_NAME}-${{ matrix.flavor }}" >> $GITHUB_ENV
-          fi
-
-      - name: Build image
-        id: build
-        env:
-          BUILD_FLAVOR: ${{ matrix.flavor }}
-        run: |
-          set -x
-          sudo podman build "--build-arg=BUILD_FLAVOR=${BUILD_FLAVOR}" -t "${IMAGE_NAME}:${DEFAULT_TAG}" -f ./Containerfile .
-
-      - name: Run Rechunker
-        id: rechunk
-        uses: hhd-dev/rechunk@5fbe1d3a639615d2548d83bc888360de6267b1a2 # v1.2.4
+      - name: Fetch Build Outputs
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          rechunk: "ghcr.io/hhd-dev/rechunk:v1.2.4"
-          ref: "localhost/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}"
-          prev-ref: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}"
-          skip_compression: true
-          labels: ${{ steps.metadata.outputs.labels }} # Rechunk strips out all the labels during build, this needs to be reapplied here with newline separator
+          pattern: ${{ env.IMAGE_NAME }}-*
+          merge-multiple: true
+          path: /tmp/artifacts
 
-      - name: Load in podman and tag
+      - name: Load Outputs
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        id: load-outputs
         run: |
-          IMAGE="$(podman pull ${{ steps.rechunk.outputs.ref }})"
-          sudo rm -rf ${{ steps.rechunk.outputs.output }}
-          for tag in ${{ steps.metadata.outputs.tags }}; do
-            podman tag $IMAGE ${{ env.IMAGE_NAME }}:$tag
+          DIGESTS_JSON="$(jq -n '{}')"
+          for digest_file in /tmp/artifacts/*.txt; do
+            # Extract the platform from the file name
+            PLATFORM="$(basename "${digest_file}" | rev | cut -d'-' -f1 | rev | cut -d'.' -f1)"
+            DIGEST="$(cat "${digest_file}")"
+            # Add the platform and digest to the JSON object
+            DIGESTS_JSON="$(echo "${DIGESTS_JSON}" | jq --arg key "${PLATFORM}" --arg value "${DIGEST}" '. + {($key): $value}')"
+          done
+          echo "DIGESTS_JSON=$(echo "$DIGESTS_JSON" | jq -c '.')" >> "${GITHUB_OUTPUT}"
+
+      - name: Create Manifest
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        id: create-manifest
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          podman manifest create ${IMAGE_REGISTRY}/${IMAGE_NAME}
+          echo "MANIFEST=${IMAGE_REGISTRY}/${IMAGE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Populate Manifest
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
+          DIGESTS_JSON: ${{ steps.load-outputs.outputs.DIGESTS_JSON }}
+          LABELS: ${{ steps.metadata.outputs.labels }}
+          PLATFORMS: "${{ inputs.platforms }}"
+        run: |
+          DIGESTS=$(echo "$DIGESTS_JSON" | jq -c '.')
+          # turn the comma separated string into a list
+          platforms=()
+          IFS=',' read -r -a platforms <<< "${PLATFORMS}"
+          for platform in ${platforms[@]}; do
+            digest="$(echo $DIGESTS | jq -r ".$platform")"
+            echo "Adding ${IMAGE_REGISTRY}/${IMAGE_NAME}@${digest} for ${platform}"
+            podman manifest add "${MANIFEST}" "${IMAGE_REGISTRY}/${IMAGE_NAME}@${digest}" --arch "${platform}"
           done
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Apply the labels to the manifest (separated by newlines)
+          while IFS= read -r label; do
+            echo "Applying label ${label} to manifest"
+            podman manifest annotate --index --annotation "$label" "${MANIFEST}"
+          done <<< "${LABELS}"
 
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2
+      - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        id: push
         env:
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ github.token }}
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          image: ${{ env.IMAGE_NAME }}
-          tags: ${{ steps.metadata.outputs.tags }}
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ env.REGISTRY_PASSWORD }}
+          REGISTRY: ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+
+      - name: Push Manifest
+        if: github.event_name != 'pull_request'
+        id: push_manifest
+        env:
+          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
+          TAGS: ${{ steps.metadata.outputs.tags }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          while IFS= read -r tag; do
+            podman manifest push --all=false --digestfile=/tmp/digestfile $MANIFEST $IMAGE_REGISTRY/$IMAGE_NAME:$tag
+          done <<< "$TAGS"
+
+          DIGEST=$(cat /tmp/digestfile)
+          echo "DIGEST=$DIGEST" >> $GITHUB_OUTPUT
+          echo "IMAGE=$IMAGE_REGISTRY/$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+  # Cosign throws errors when ran inside the Fedora container for one reason or another
+  # so we move this to another step in order to run on Ubuntu
+  sign:
+    needs: manifest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          REGISTRY: ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+          cat ${XDG_RUNTIME_DIR}/containers/auth.json > ~/.docker/config.json
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
 
-      - name: Sign container image
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        run: |
-          cosign sign -y --key env://COSIGN_PRIVATE_KEY "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST"
+      - name: Sign Manifest
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ needs.manifest.outputs.digest }}
+          IMAGE: ${{ needs.manifest.outputs.image }}
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${DIGEST}"
