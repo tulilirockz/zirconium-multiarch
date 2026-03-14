@@ -6,7 +6,7 @@ COPY build_files /build
 COPY system_files /files
 COPY cosign.pub /files/etc/pki/containers/zirconium.pub
 
-FROM quay.io/fedora/fedora-bootc:43
+FROM quay.io/fedora/fedora-bootc:45@sha256:54e1d4b081cb9df114f4fac806dd7922d3b414ada45f1a446784df6d4017e0c0
 ARG BUILD_FLAVOR="${BUILD_FLAVOR:-}"
 
 RUN exit 0
